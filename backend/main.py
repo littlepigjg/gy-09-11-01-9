@@ -6,7 +6,7 @@
 #   2. 聚合查询 min/max/avg/sum (SQL 侧完成, 避免拉取原始数据)
 #   3. 降采样: 固定桶大小时间窗口聚合 (LTTB 风格桶聚合)
 #   4. 自动路由: 大时间跨度查询命中小时级预聚合表
-#   5. 异常点检测: 基于滑动窗口 Z-Score
+#   5. 异常点检测: 滑动窗口 Z-Score, 多指标独立检测 + 逐指标阈值
 # =============================================================
 import math
 import os
@@ -301,36 +301,10 @@ def latest_points(
 
 
 # ---------------------------------------------------------------
-# API: 异常点检测 (滑动窗口 Z-Score)
+# API: 异常点检测 (滑动窗口 Z-Score, 多指标 + 逐指标阈值)
 # ---------------------------------------------------------------
-@app.get("/api/anomalies")
-def detect_anomalies(
-    metric: str = Query(...),
-    instance: str = Query(""),
-    start: float = Query(...),
-    end: float = Query(...),
-    window: int = Query(20, description="滑动窗口大小(点数)"),
-    threshold: float = Query(3.0, description="Z-Score阈值"),
-):
-    """
-    异常点标注: 对每个原始点, 用前 window 个点计算均值/标准差,
-    |z| > threshold 判定为异常。返回异常点列表供前端高亮。
-    """
-    start_dt = datetime.fromtimestamp(start)
-    end_dt = datetime.fromtimestamp(end)
-    with pool.acquire() as conn, conn.cursor() as cur:
-        id_map = _resolve_metric_ids(cur, [metric], instance)
-        mids = id_map.get(metric, [])
-        if not mids:
-            return {"anomalies": []}
-        id_cond = "metric_id=%s" if len(mids) == 1 else f"metric_id IN ({','.join(['%s'] * len(mids))})"
-        cur.execute(
-            f"SELECT UNIX_TIMESTAMP(ts)*1000 AS ts, value FROM metric_data "
-            f"WHERE {id_cond} AND ts >= %s AND ts < %s ORDER BY ts",
-            (*mids, start_dt, end_dt),
-        )
-        rows = cur.fetchall()
-
+def _zscore_anomalies(rows: list[dict], window: int, threshold: float) -> list[dict]:
+    """对单个指标按时间有序的点序列做滑动窗口 Z-Score 检测。"""
     anomalies = []
     values = [r["value"] for r in rows]
     for i, r in enumerate(rows):
@@ -344,7 +318,58 @@ def detect_anomalies(
             z = abs(r["value"] - mean) / std
             if z > threshold:
                 anomalies.append({"ts": int(r["ts"]), "value": r["value"], "zscore": round(z, 2)})
-    return {"anomalies": anomalies}
+    return anomalies
+
+
+@app.get("/api/anomalies")
+def detect_anomalies(
+    metrics: str = Query(..., description="逗号分隔的指标名, 一次请求检测多个指标"),
+    instance: str = Query(""),
+    start: float = Query(...),
+    end: float = Query(...),
+    window: int = Query(20, ge=1, le=500, description="滑动窗口大小(点数)"),
+    threshold: float = Query(3.0, ge=0, description="默认Z-Score阈值"),
+    thresholds: str = Query("", description="逗号分隔的逐指标阈值, 与 metrics 按位置对齐, 缺省项回退到 threshold"),
+):
+    """
+    多指标异常点标注: 每个指标独立做滑动窗口 Z-Score 检测,
+    阈值可按指标单独指定 (thresholds 与 metrics 顺序对齐)。
+    一次请求返回全部指标的异常点坐标与统计, 供前端分指标高亮。
+    """
+    names = [m.strip() for m in metrics.split(",") if m.strip()]
+    if not names:
+        return {"results": {}}
+    # 解析逐指标阈值, 缺省或非法项回退到默认 threshold
+    parts = [p.strip() for p in thresholds.split(",")]
+    per_metric: list[float] = []
+    for i in range(len(names)):
+        t = threshold
+        if i < len(parts) and parts[i]:
+            try:
+                t = float(parts[i])
+            except ValueError:
+                pass
+        per_metric.append(t)
+
+    start_dt = datetime.fromtimestamp(start)
+    end_dt = datetime.fromtimestamp(end)
+    results: dict[str, dict] = {}
+    with pool.acquire() as conn, conn.cursor() as cur:
+        id_map = _resolve_metric_ids(cur, names, instance)
+        for name, thr in zip(names, per_metric):
+            mids = id_map.get(name, [])
+            if not mids:
+                results[name] = {"threshold": thr, "count": 0, "anomalies": []}
+                continue
+            id_cond = "metric_id=%s" if len(mids) == 1 else f"metric_id IN ({','.join(['%s'] * len(mids))})"
+            cur.execute(
+                f"SELECT UNIX_TIMESTAMP(ts)*1000 AS ts, value FROM metric_data "
+                f"WHERE {id_cond} AND ts >= %s AND ts < %s ORDER BY ts",
+                (*mids, start_dt, end_dt),
+            )
+            anomalies = _zscore_anomalies(cur.fetchall(), window, thr)
+            results[name] = {"threshold": thr, "count": len(anomalies), "anomalies": anomalies}
+    return {"results": results}
 
 
 if __name__ == "__main__":

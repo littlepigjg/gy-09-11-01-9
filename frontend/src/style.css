@@ -90,3 +90,27 @@ button.primary { background: linear-gradient(90deg, #1565c0, #4527a0); border: n
 .meta .hl { color: #4fc3f7; }
 
 .legend-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+
+/* 逐指标异常阈值调节 */
+.threshold-list { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.threshold-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 14px;
+  border: 1px solid #31405e;
+  background: #1a2333;
+  font-size: 12px;
+}
+.threshold-input {
+  width: 56px;
+  background: #1e2940;
+  color: #d7dde8;
+  border: 1px solid #31405e;
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-size: 12px;
+}
+.threshold-input:focus { outline: none; border-color: #4fc3f7; }
+.threshold-hint { font-size: 12px; color: #5c6880; }

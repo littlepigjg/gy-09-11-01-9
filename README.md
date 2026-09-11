@@ -9,7 +9,7 @@
 - **数据过期策略**：定时事件每日 `DROP PARTITION`（原始数据保留 30 天），无碎片、秒级回收
 - **降采样聚合**：SQL 侧时间桶聚合（min/max/avg/sum），桶大小按时间跨度自动对齐（1s~1d）
 - **预聚合加速**：小时级物化表，跨度 >7 天查询自动路由，30 天查询毫秒级返回
-- **异常点检测**：滑动窗口 Z-Score 算法，曲线上红色高亮标注
+- **异常点检测**：滑动窗口 Z-Score 算法，所有选中指标独立检测，逐指标阈值可调，异常点颜色与对应曲线同色并按指标分别统计
 - **实时可视化**：实时曲线、多指标对比、时间范围/聚合方式切换、图表缩放
 
 ## 快速开始
@@ -105,7 +105,7 @@ tsdb/
 | GET | `/api/metrics` | 指标列表与数据点统计 |
 | GET | `/api/query` | 聚合 + 降采样查询（`metrics/start/end/agg/bucket`） |
 | GET | `/api/latest` | 最近窗口原始点（实时曲线） |
-| GET | `/api/anomalies` | 滑动窗口 Z-Score 异常点检测 |
+| GET | `/api/anomalies` | 多指标滑动窗口 Z-Score 异常检测（`metrics` 多指标 + `thresholds` 逐指标阈值） |
 | GET | `/api/health` | 健康检查 |
 
 写入示例：
@@ -122,6 +122,12 @@ curl -X POST http://localhost:8000/api/write \
 curl "http://localhost:8000/api/query?metrics=cpu.usage,mem.usage&start=1788800000&end=1788900000&agg=avg"
 ```
 
+多指标异常检测示例（`thresholds` 与 `metrics` 按位置对齐，缺省则用 `threshold`）：
+
+```bash
+curl "http://localhost:8000/api/anomalies?metrics=cpu.usage,mem.usage&thresholds=3.0,2.5&start=1788800000&end=1788900000"
+```
+
 ## 核心设计
 
 **时序索引与分区**：`metric_data` 表 `PARTITION BY RANGE (TO_DAYS(ts))` 按天分区，主键 `(id, metric_id, ts)` 配合复合索引 `(metric_id, ts)`；时间范围查询仅扫描相关分区（分区裁剪），EXPLAIN 验证只命中单天分区。
@@ -133,7 +139,7 @@ curl "http://localhost:8000/api/query?metrics=cpu.usage,mem.usage&start=17888000
 1. 在线桶聚合：`GROUP BY FLOOR(UNIX_TIMESTAMP(ts)/bucket)`，桶大小按跨度自动选择。
 2. 预聚合表 `metric_data_hourly`：事件每小时增量聚合；大跨度查询自动改查预聚合表，avg 以 `SUM(sum)/SUM(count)` 加权保证准确性。
 
-**异常检测**：对每个数据点用其前 N 个点（默认 20）计算均值与标准差，`|z| > 阈值（默认 3）`判定为异常并返回坐标，前端以红色散点叠加在曲线上。
+**异常检测**：一次请求可对多个指标分别做滑动窗口 Z-Score 检测——对每个指标的每个数据点用其前 N 个点（默认 20）计算均值与标准差，`|z| > 阈值`判定为异常；每个指标可通过 `thresholds` 参数指定独立阈值（默认 3），返回按指标分组的异常坐标与计数，前端为每个指标叠加与曲线同色的三角散点，并按指标分别展示异常统计。
 
 ## 本地开发（可选）
 

@@ -52,26 +52,53 @@
       </div>
     </div>
 
-    <div class="chart-card">
-      <h3>多指标对比 · 降采样曲线（聚合: {{ agg.toUpperCase() }} / 桶: {{ queryMeta.bucket }}s ·
-        数据源: {{ queryMeta.source === 'hourly' ? '小时预聚合表' : '原始分区表' }} ·
-        耗时: {{ queryMeta.elapsed }}ms · 异常点: {{ anomalyCount }}）</h3>
-      <div ref="historyChart" class="chart chart-tall"></div>
+    <div class="toolbar" v-if="selected.length">
+      <div class="group">
+        <label>异常阈值</label>
+        <div class="threshold-list">
+          <span v-for="m in selected" :key="m" class="threshold-item">
+            <span class="legend-dot" :style="{ background: colorOf(m) }"></span>
+            {{ m }}
+            <input
+              class="threshold-input"
+              type="number"
+              min="0.5" max="10" step="0.5"
+              v-model.number="thresholds[m]"
+              @change="onThresholdChange"
+            />
+          </span>
+          <span class="threshold-hint">Z-Score 超过对应指标阈值即标注异常</span>
+        </div>
+      </div>
     </div>
 
     <div class="chart-card">
-      <h3>实时曲线（最近 {{ liveWindow }} 秒原始点）· 异常点以红色标注</h3>
+      <h3>多指标对比 · 降采样曲线（聚合: {{ agg.toUpperCase() }} / 桶: {{ queryMeta.bucket }}s ·
+        数据源: {{ queryMeta.source === 'hourly' ? '小时预聚合表' : '原始分区表' }} ·
+        耗时: {{ queryMeta.elapsed }}ms · 异常点: {{ histAnomalyTotal }}）</h3>
+      <div ref="historyChart" class="chart chart-tall"></div>
+      <div class="meta">
+        <span v-for="m in selected" :key="m">
+          <span class="legend-dot" :style="{ background: colorOf(m) }"></span>{{ m }} 异常: <span class="hl">{{ histAnomalyStats[m] || 0 }}</span>
+        </span>
+      </div>
+    </div>
+
+    <div class="chart-card">
+      <h3>实时曲线（最近 {{ liveWindow }} 秒原始点）· 异常点颜色与对应指标曲线一致</h3>
       <div ref="liveChart" class="chart"></div>
       <div class="meta">
-        <span><span class="legend-dot" style="background:#ff5252"></span>异常点 (滑动窗口 Z-Score &gt; {{ anomalyThreshold }})</span>
-        <span>异常总数: <span class="hl">{{ anomalyCount }}</span></span>
+        <span v-for="m in selected" :key="m">
+          <span class="legend-dot" :style="{ background: colorOf(m) }"></span>{{ m }} 异常: <span class="hl">{{ liveAnomalyStats[m] || 0 }}</span>
+        </span>
+        <span>异常总计: <span class="hl">{{ liveAnomalyTotal }}</span></span>
       </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import * as echarts from 'echarts'
 
 const API = ''
@@ -93,8 +120,15 @@ const rangeSec = ref(21600)
 const agg = ref('avg')
 const live = ref(true)
 const liveWindow = 300
-const anomalyThreshold = 3.0
-const anomalyCount = ref(0)
+const DEFAULT_THRESHOLD = 3.0
+// 每个选中指标独立的异常阈值 (指标名 -> Z-Score 阈值)
+const thresholds = reactive({})
+// 历史/实时图表各自的按指标异常统计 (指标名 -> 异常点数)
+const histAnomalyStats = reactive({})
+const liveAnomalyStats = reactive({})
+// 总计只汇总当前选中的指标, 避免取消勾选后残留旧值
+const histAnomalyTotal = computed(() => selected.value.reduce((s, m) => s + (histAnomalyStats[m] || 0), 0))
+const liveAnomalyTotal = computed(() => selected.value.reduce((s, m) => s + (liveAnomalyStats[m] || 0), 0))
 
 const queryMeta = reactive({ bucket: '-', source: 'raw', elapsed: '-' })
 
@@ -106,6 +140,25 @@ let liveTimer = null
 let liveAnomalyTimer = null
 
 const COLORS = ['#4fc3f7', '#ffb74d', '#81c784', '#ba68c8', '#f06292', '#4dd0e1']
+
+// 曲线/异常点/阈值标识/统计圆点统一按指标名取色, 保证同一指标颜色一致
+function colorOf(name) {
+  const i = selected.value.indexOf(name)
+  return COLORS[(i >= 0 ? i : 0) % COLORS.length]
+}
+
+// 新选中的指标补默认阈值
+function ensureThresholds() {
+  for (const m of selected.value) {
+    if (thresholds[m] == null) thresholds[m] = DEFAULT_THRESHOLD
+  }
+}
+
+// 整体替换统计对象, 清掉已取消勾选指标的残留计数
+function replaceStats(target, stats) {
+  Object.keys(target).forEach(k => delete target[k])
+  Object.assign(target, stats)
+}
 
 async function fetchJson(url) {
   const r = await fetch(API + url)
@@ -123,21 +176,32 @@ async function loadMetrics() {
   if (!selected.value.some(s => names.includes(s)) && names.length) {
     selected.value = names.slice(0, 2)
   }
+  ensureThresholds()
 }
 
 function toggleMetric(m) {
   const i = selected.value.indexOf(m)
   if (i >= 0) selected.value.splice(i, 1)
   else selected.value.push(m)
+  ensureThresholds()
   onQuery()
 }
 function setRange(s) { rangeSec.value = s; onQuery() }
 function setAgg(a) { agg.value = a; onQuery() }
 function toggleLive() { live.value = !live.value; scheduleLive() }
+// 阈值调整后重算历史区间与实时窗口的异常点
+function onThresholdChange() {
+  onQuery()
+  if (live.value) refreshAnomalies()
+}
 
 // ---------- 历史查询: 多指标对比 + 降采样 ----------
 async function onQuery() {
-  if (!selected.value.length) { histInst.setOption({ series: [] }); return }
+  if (!selected.value.length) {
+    replaceStats(histAnomalyStats, {})
+    histInst.setOption({ series: [] })
+    return
+  }
   const end = Math.floor(Date.now() / 1000)
   const start = end - rangeSec.value
   const q = new URLSearchParams({
@@ -151,43 +215,63 @@ async function onQuery() {
   queryMeta.source = data.source
   queryMeta.elapsed = data.elapsed_ms
 
-  const series = Object.entries(data.series || {}).map(([name, pts], idx) => ({
-    name,
-    type: 'line',
-    smooth: true,
-    showSymbol: false,
-    lineStyle: { width: 2 },
-    itemStyle: { color: COLORS[idx % COLORS.length] },
-    data: pts.map(p => [p.ts * 1000, p.value]),
-    connectNulls: true,
-  }))
+  // 按选中顺序构建曲线, 颜色由 colorOf 固定到指标名
+  const series = selected.value
+    .filter(name => (data.series || {})[name])
+    .map(name => ({
+      name,
+      type: 'line',
+      smooth: true,
+      showSymbol: false,
+      lineStyle: { width: 2 },
+      itemStyle: { color: colorOf(name) },
+      data: data.series[name].map(p => [p.ts * 1000, p.value]),
+      connectNulls: true,
+    }))
 
-  // 对第一个选中指标做异常点检测, 在历史曲线上以红色散点标注
-  const anomalies = await fetchAnomalies(selected.value[0], start, end)
-  anomalyCount.value = anomalies.length
-  if (anomalies.length) {
-    series.push({
-      name: '异常点',
-      type: 'scatter',
-      symbolSize: 11,
-      itemStyle: { color: '#ff5252', borderColor: '#fff', borderWidth: 1 },
-      data: anomalies.map(a => [a.ts, a.value]),
-      z: 10,
-    })
+  // 所有选中指标独立检测异常(一次请求), 异常点颜色与各自曲线一致
+  const results = await fetchAllAnomalies(start, end)
+  const stats = {}
+  for (const name of selected.value) {
+    const res = results[name]
+    stats[name] = res ? res.count : 0
+    if (res && res.anomalies.length) {
+      series.push(buildAnomalySeries(name, res.anomalies))
+    }
   }
+  replaceStats(histAnomalyStats, stats)
 
   histInst.setOption(buildBaseOption(false, series), true)
 }
 
-async function fetchAnomalies(metric, start, end) {
-  if (!metric) return []
+// 一次请求获取全部选中指标的异常检测结果
+async function fetchAllAnomalies(start, end) {
+  if (!selected.value.length) return {}
   const q = new URLSearchParams({
-    metric, instance: instance.value,
+    metrics: selected.value.join(','),
+    instance: instance.value,
     start: String(start), end: String(end),
-    threshold: String(anomalyThreshold),
+    thresholds: selected.value.map(m => thresholds[m] ?? DEFAULT_THRESHOLD).join(','),
   })
   const data = await fetchJson('/api/anomalies?' + q.toString())
-  return data.anomalies || []
+  return data.results || {}
+}
+
+// 单个指标的异常点散点序列, 颜色与该指标曲线一致
+function buildAnomalySeries(name, anomalies) {
+  return {
+    id: 'anomaly-' + name,
+    name: name + ' 异常',
+    type: 'scatter',
+    symbol: 'triangle',
+    symbolSize: 12,
+    itemStyle: { color: colorOf(name), borderColor: '#fff', borderWidth: 1 },
+    data: anomalies.map(a => [a.ts, a.value]),
+    z: 10,
+    tooltip: {
+      formatter: p => `${name} 异常点<br/>值: ${p.value[1].toFixed(2)}<br/>${new Date(p.value[0]).toLocaleTimeString()}`,
+    },
+  }
 }
 
 // ---------- 实时曲线 + 异常点标注 ----------
@@ -200,43 +284,39 @@ async function refreshLive() {
   })
   const data = await fetchJson('/api/latest?' + q.toString())
 
-  const series = Object.entries(data.series || {}).map(([name, pts], idx) => ({
-    name,
-    type: 'line',
-    smooth: true,
-    showSymbol: false,
-    lineStyle: { width: 2 },
-    itemStyle: { color: COLORS[idx % COLORS.length] },
-    data: pts.map(p => [p.ts, p.value]),
-    connectNulls: true,
-  }))
+  const series = selected.value
+    .filter(name => (data.series || {})[name])
+    .map(name => ({
+      name,
+      type: 'line',
+      smooth: true,
+      showSymbol: false,
+      lineStyle: { width: 2 },
+      itemStyle: { color: colorOf(name) },
+      data: data.series[name].map(p => [p.ts, p.value]),
+      connectNulls: true,
+    }))
   liveInst.setOption(buildBaseOption(true, series), { replaceMerge: ['series'] })
 }
 
 async function refreshAnomalies() {
-  // 对第一个选中指标做异常点标注
-  const metric = selected.value[0]
-  if (!metric) return
+  // 所有选中指标独立做异常点标注
+  if (!selected.value.length) { replaceStats(liveAnomalyStats, {}); return }
   const end = Math.floor(Date.now() / 1000)
   const start = end - liveWindow
-  const q = new URLSearchParams({ metric, instance: instance.value, start: String(start), end: String(end), threshold: String(anomalyThreshold) })
-  const data = await fetchJson('/api/anomalies?' + q.toString())
-  const anomalies = data.anomalies || []
-  anomalyCount.value = anomalies.length
-  const scatter = {
-    name: '异常点',
-    type: 'scatter',
-    symbolSize: 12,
-    itemStyle: { color: '#ff5252', borderColor: '#fff', borderWidth: 1 },
-    data: anomalies.map(a => [a.ts, a.value]),
-    z: 10,
-    tooltip: {
-      formatter: p => `异常点<br/>值: ${p.value[1].toFixed(2)}<br/>${new Date(p.value[0]).toLocaleTimeString()}`,
-    },
+  const results = await fetchAllAnomalies(start, end)
+  const stats = {}
+  const scatters = []
+  for (const name of selected.value) {
+    const res = results[name]
+    stats[name] = res ? res.count : 0
+    if (res && res.anomalies.length) scatters.push(buildAnomalySeries(name, res.anomalies))
   }
-  // 追加异常点散点序列(不清空已有曲线)
+  replaceStats(liveAnomalyStats, stats)
+  // 追加各指标异常点散点序列(不清空已有曲线)
   const opt = liveInst.getOption()
-  liveInst.setOption({ series: [...opt.series.filter(s => s.name !== '异常点'), scatter] })
+  const kept = (opt.series || []).filter(s => !String(s.id || '').startsWith('anomaly-'))
+  liveInst.setOption({ series: [...kept, ...scatters] })
 }
 
 function buildBaseOption(isLive, series) {
@@ -291,6 +371,7 @@ onMounted(async () => {
   liveInst = echarts.init(liveChart.value, 'dark')
   window.addEventListener('resize', () => { histInst.resize(); liveInst.resize() })
   await loadMetrics()
+  ensureThresholds()
   await onQuery()
   scheduleLive()
   // 指标列表每 10 秒刷新一次统计
